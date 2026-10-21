@@ -1,0 +1,20 @@
+# Prewarm seed list (shipped in the app, next to shader_map.tsv). Rows: S<TAB>shader key<TAB>stage / R<TAB>render pipeline key (pso_skey hex) / C<TAB>compute shader key.
+# CANDIDATE from MacNativeGames shader_list.tsv — S/C collapsed to dm_ctl_sha16_b where key[:16] ∈ shader_map; R rows skipped (incompatible key blob).
+# NOT wired as pso_manifest.tsv yet. Stats: {'s_in': 26, 's_out': 16, 's_skip': 10, 'c_in': 0, 'c_out': 0, 'c_skip': 0, 'r_skip': 31, 'v_kept': 1718}
+# Review on Mac before renaming to pso_manifest.tsv. Translator chain may differ (MNG totk-native-v6-unverified).
+S	e4b5b0967a3cd0b3_b	0
+S	ecb4242efaf4042b_b	1
+S	f557b8d58e94d91c_b	0
+S	06d68917ae28a29d_b	1
+S	6073f8d9957a606c_b	0
+S	8d86a30ea20df71b_b	1
+S	ed5e159c13b1f3ba_b	0
+S	9d1d8f94d5295369_b	1
+S	704a04d82662ce74_b	0
+S	17dccd27ad609e8b_b	0
+S	de6a821edff3953e_b	0
+S	84766a37a5c8a80e_b	1
+S	15ba6d135f8daf6a_b	0
+S	14b765579e75b857_b	1
+S	5176be858cbddf45_b	0
+S	fcf8cd65158243d9_b	1
