@@ -1076,6 +1076,8 @@ def parse_args(argv):
     ap.add_argument('--app-name', help='app name on the home screen (default: the game name in the base NSP)')
     ap.add_argument('--bundle-id', help='the app\'s bundle ID (default: org.nxnative.<base game title ID in lowercase>)')
     ap.add_argument('--keep-extracted', action=argparse.BooleanOptionalAction, help='keep the extracted game files after the IPA is built, for the next build (default: the KEEP_EXTRACTED setting, on)')
+    ap.add_argument('--slim', action=argparse.BooleanOptionalAction, default=True, help='pack the IPA without the RomFS: the app reads the game files from Documents/romfs (a directory tree or a ROMFSARC archive, see docs/ROMFS_ARCHIVE.md). Default on — a full package of a large game is many GB and iOS refuses to install it (PackageExtractionFailed)')
+    ap.add_argument('--full-romfs', dest='slim', action='store_false', help='pack the RomFS into the IPA (upstream behaviour; only sensible for small games)')
     ap.add_argument('--env-file', help='environment switches for a diagnostic build (one KEY=VALUE per line)')
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
     ap.add_argument('--allow-damaged', action='store_true', help='a damaged NSP (files failing the NCA hash check): write them as read and go on instead of stopping')
@@ -1198,6 +1200,9 @@ def main(args=None):
     else: say('[RED] no game icon in the extraction (an older extraction did not save it: delete extract/ and run again); the home-screen icon will be blank')
     env_file = args.env_file or DM_ENV_FILE
     if env_file: ipa_env['DM_ENV_FILE'] = str(Path(os.path.expanduser(env_file)).resolve())
+    if args.slim:
+        ipa_env['DM_NO_ROMFS'] = '1'
+        say('slim IPA: the RomFS stays out of the package (pack the archive with dm/tools/romfs_arc.py and copy it to the app\'s Documents/romfs; --full-romfs packs it instead)')
     watch = IpaWatch(repo, work / 'ipa', out_ipa)
     PROG.stage('app build', poll=watch.poll, step='starting')   # build_ipa.sh's "pack IPA" line starts the stage "IPA pack"
     run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], logs / 'build_ipa.log', env=ipa_env, on_line=watch.line)

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Raise the per-process physical memory (jetsam) limit. Without it an iPhone
+	     gives this app about 3.3 GB, which stops large titles (Tears of the Kingdom
+	     reaches its budget entering the world map; Hades II asks for a 3.10 GB heap).
+
+	     The entitlement has to be present in the signature AND enabled on the App ID
+	     for the provisioning profile to carry it. A sideloader that drops unknown
+	     entitlements will ignore this; see dm/ios/ENTITLEMENTS.md for which tools
+	     keep it and how to attach it to an App ID with a free Apple ID. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>
