@@ -77,8 +77,29 @@ APP=$DD/Build/Products/Release-iphoneos/DmIOS.app; [ -d "$APP" ] || APP=$(grep -
 # the app sets DM_AOC_DIR at launch, the host reports them as owned and mounts them from it) and the RomFS
 rm -rf "$APP/msl" "$O/Payload" "$O/out.ipa"   # (the last two: what the copy-and-zip packing left behind)
 P=Payload/DmIOS.app; MAPS=("$P=$APP" "$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR")
+# Increased Memory Limit: the build is unsigned, so Xcode never merges Sources/DmIOS.entitlements
+# into a signature. A sideloader reads the entitlements it should keep from the signature it is
+# replacing — an unsigned binary has none, so the request would be lost. Embed them with an ad-hoc
+# ("-" identity, no certificate needed) placeholder signature: the sideloader strips this signature
+# anyway and swaps in the user's own, but it now sees the entitlement and carries it over. The file
+# also stays in the bundle for tools that look there. See dm/ios/ENTITLEMENTS.md.
+cp Sources/DmIOS.entitlements "$APP/DmIOS.entitlements" || die "copy entitlements into the app bundle"
+codesign --force --sign - --entitlements Sources/DmIOS.entitlements "$APP" \
+  || die "ad-hoc sign with entitlements (the sideloader re-signs; this only carries the request)"
+codesign -d --entitlements :- "$APP" | grep -q increased-memory-limit \
+  || die "entitlements did not make it into the placeholder signature"
+t "entitlements: increased-memory-limit embedded in the placeholder signature"
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
-MAPS+=("$P/romfs=$ROMFS")
-t "pack IPA (already-compressed game files stored, everything else deflated)"
-python3 tools/pack_ipa.py "$OUT_IPA" --store "$(gp zip_store)" --skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs "${MAPS[@]}" || die "pack_ipa"
+# Slim IPA is the default (Documents/romfs or a ROMFSARC archive at run time). Set DM_FULL_ROMFS=1
+# to pack RomFS into the IPA (upstream; only sensible for small games). DM_NO_ROMFS=1 is accepted as
+# an explicit slim request from docs/ROMFS_ARCHIVE.md and scripts/build_ipa_from_nsp.py --slim.
+if [ -n "${DM_NO_ROMFS:-}" ]; then unset DM_FULL_ROMFS; fi
+if [ -z "${DM_FULL_ROMFS:-}" ]; then
+  t "pack slim IPA without RomFS (game files come from Documents/romfs; DM_FULL_ROMFS=1 packs them)"
+  python3 tools/pack_ipa.py "$OUT_IPA" --store "$(gp zip_store)" --skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs "${MAPS[@]}" || die "pack_ipa"
+else
+  MAPS+=("$P/romfs=$ROMFS")
+  t "pack full IPA with RomFS (already-compressed game files stored, everything else deflated)"
+  python3 tools/pack_ipa.py "$OUT_IPA" --store "$(gp zip_store)" --skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs "${MAPS[@]}" || die "pack_ipa"
+fi
 t "done: $OUT_IPA ($(du -h "$OUT_IPA" | cut -f1))"

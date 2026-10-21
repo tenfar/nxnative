@@ -55,6 +55,11 @@ targets:
       CURRENT_PROJECT_VERSION: ${DM_APP_VERSION}
       DEVELOPMENT_TEAM: ${DM_TEAM_ID}
       CODE_SIGN_STYLE: Automatic
+      # Increased Memory Limit: the app requests a higher jetsam budget (6-8 GB instead of ~3.3 GB).
+      # build_ipa.sh builds unsigned (CODE_SIGNING_ALLOWED=NO), so this only records the request in the
+      # app's signature; the sideloader has to keep it and the App ID has to have it enabled. See
+      # dm/ios/ENTITLEMENTS.md.
+      CODE_SIGN_ENTITLEMENTS: Sources/DmIOS.entitlements
       ASSETCATALOG_COMPILER_APPICON_NAME: $(DM_APPICON)   # Gen/dm.xcconfig sets DM_APPICON = AppIcon when there is a game icon; empty = no icon (xcodegen's default is AppIcon, which fails the build when the catalog lacks it)
       TARGETED_DEVICE_FAMILY: "1,2"
       ENABLE_BITCODE: NO

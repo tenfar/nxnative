@@ -6,6 +6,7 @@
 // Struct layout follows the public Horizon ABI: DirectoryEntry = {char name[0x301], pad[3], s8 type, pad[3], s64 size} (0x310 bytes).
 #include "hle.h"
 #include "front.h"
+#include "romfs_arc.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -276,6 +277,15 @@ static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create)
         char normed[1024]; const char *rest = c + 1;
         if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) return 0; rest = normed; }   // only paths with "." components are normalized; the rest walk component by component as before
         if (g_mnt[i].overlay[0] && !create) return rom_overlay_path(&g_mnt[i], rest, out, n);
+        // Archive mount: the RomFS tree lives in a ROMFSARC archive, so the host path is a synthetic
+        // name carrying the guest path. Every read path (OpenFile, GetEntryType, OpenDirectory) sees
+        // it and routes to romfs_arc.c; nothing else can produce this prefix.
+        // The mount name varies by title ("rom" for most, "content" for Tears of the Kingdom), so the
+        // test is on the mount's directory (the archive base) rather than on its name.
+        if (romfsarc_active() && g_mnt[i].ro && !create && g_mnt[i].dir[0] && !strcmp(g_mnt[i].dir, g_arc_base)) {
+            if (snprintf(out, n, ROMFSARC_SYNTH_PREFIX "%s", rest) >= (int)n) { errno = ENAMETOOLONG; return 0; }
+            return 1;
+        }
         strlcpy(out, g_mnt[i].dir, n);
         while (*rest) {
             while (*rest == '/') rest++;
@@ -294,6 +304,24 @@ static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create)
     errno = ENOENT; return 0;
 }
 static int host_path(const char *p, char *out, size_t n, int *ro) { return host_path_ex(p, out, n, ro, 0); }
+// ---------- Archive-backed RomFS ----------
+// The archive keeps its own file table; these helpers turn a synthetic host path into archive
+// coordinates. Called with PATH_LOCK held (the callers hold it), and only when romfsarc_active().
+static int arc_file(const char *hp, uint32_t *shard, uint64_t *off, uint64_t *size) {
+    const char *rel = ROMFSARC_SYNTH_REL(hp);
+    while (*rel == '/') rel++;
+    return romfsarc_stat_file(rel, shard, off, size);
+}
+static int arc_dir(const char *hp) {
+    const char *rel = ROMFSARC_SYNTH_REL(hp);
+    while (*rel == '/') rel++;
+    return romfsarc_is_dir(rel);
+}
+static void arc_norm(const char *hp, char *rel, size_t n) {
+    const char *r = ROMFSARC_SYNTH_REL(hp);
+    while (*r == '/') r++;
+    strlcpy(rel, r, n);
+}
 static int set_guest_name(const char *hp, const char *path) {
     const char *end = path + strlen(path); while (end > path && end[-1] == '/') end--;
     const char *start = end; while (start > path && start[-1] != '/' && start[-1] != ':') start--;
@@ -319,16 +347,33 @@ static Result err_res(const char *op, const char *path) {
 
 // ---------- Mount ----------
 HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv; rom reads the host directory directly, the cache gets only the minimum size", Result, h_fs_QueryRomCache, size_t *out) { *out = 0x1000; return RES_OK; }
-HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
+HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory (or a ROMFSARC archive when $DM_ROMFS ends in .idx or names a base with .idx beside it)", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
     (void)cache; (void)sz; char b[1024];
-    Result r = mount(name, envdir("DM_ROMFS", "data/switch/3.3.94012/Update/RomFS", b, sizeof b), 1);
-    if (r == RES_OK && getenv("DM_ROMFS_OVERLAY")) {
+    const char *dir = envdir("DM_ROMFS", "data/switch/3.3.94012/Update/RomFS", b, sizeof b);
+    // Archive mount: romfsarc_open tries <dir>.idx, <dir>/romfs.idx and <dir>/romfs/romfs.idx, so
+    // $DM_ROMFS may name the base, the .idx file or the directory that holds the archive.
+    romfsarc_hdr h;
+    int is_arc = romfsarc_open(dir, &h) == 0;
+    if (is_arc) {
+        // Mount the resolved archive base (romfsarc_open tried <dir>.idx, <dir>/romfs.idx and one
+        // more level, and recorded the one that worked in g_arc_base). host_path_ex compares mount
+        // directories against that, so the two must be the same string.
+        Result r = mount(name, g_arc_base, 1);
+        if (r != RES_OK) { romfsarc_close(); return r; }
+        LOG("fs rom: archive %s (%llu files, %llu dirs, %u shards, tree hash %016llx)", g_arc_base,
+            (unsigned long long)h.file_count, (unsigned long long)h.dir_count, h.shard_count,
+            (unsigned long long)h.tree_hash);
+    } else {
+        Result r = mount(name, dir, 1);
+        if (r != RES_OK) return r;
+    }
+    if (getenv("DM_ROMFS_OVERLAY")) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {
             strlcpy(g_mnt[i].overlay, getenv("DM_ROMFS_OVERLAY"), sizeof g_mnt[i].overlay); break;
         }
     }
-    return r;
+    return RES_OK;
 }
 // Add-on content (DLC) RomFS: DM_AOC_DIR/<index>/, extracted from the player's DLC NSPs by the packing script; mounted read-only, using the directory index like rom.
 // The owned index list is reported by the aoc calls in hle_misc.c from the same directory; the game only mounts indices it was given, and a missing directory answers "target not found" (fs 2-1002, as on hardware without that DLC)
@@ -639,9 +684,43 @@ ssize_t dm_data_pread(int fd, void *buf, size_t n, off_t off) {   // Same semant
     }
     return (ssize_t)done;
 }
+// ---------- Archive-backed file handles ----------
+// An archive file has no host fd. It gets a handle number from a private table, and every operation
+// on it (ReadFile, GetFileSize, CloseFile) checks the table first. Handle numbers are distinct from
+// fds: real handles are fds (>= 3 in practice), archive handles are tagged by index into g_arc[].
+typedef struct { uint32_t shard; uint64_t off, size; int used; } archandle;
+#define MAX_ARCH 4096
+static archandle g_arc[MAX_ARCH];
+static uint64_t g_arch_gen;   // bumped on open/close so a stale handle never hits a recycled slot
+static uint64_t arc_new(uint32_t shard, uint64_t off, uint64_t size) {
+    for (int i = 0; i < MAX_ARCH; i++) if (!g_arc[i].used) {
+        g_arc[i].used = 1; g_arc[i].shard = shard; g_arc[i].off = off; g_arc[i].size = size;
+        return ((uint64_t)1 << 63) | ((g_arch_gen & 0x7fffffff) << 32) | (uint32_t)i;
+    }
+    return 0;
+}
+static int arc_get(uint64_t h, archandle **out) {
+    if (!(h >> 63)) return 0;
+    uint32_t i = (uint32_t)h;
+    if (i >= MAX_ARCH || !g_arc[i].used) return 0;
+    if ((uint32_t)((h >> 32) & 0x7fffffff) != (uint32_t)(g_arch_gen & 0x7fffffff)) return 0;
+    *out = &g_arc[i]; return 1;
+}
+static void arc_free(uint64_t h) {
+    archandle *a; if (arc_get(h, &a)) a->used = 0;
+}
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
     HP(path);
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
+    if (ROMFSARC_IS_SYNTH(hp)) {   // archive entry: no fd, the handle carries shard/offset/size
+        uint32_t shard; uint64_t off, size;
+        if (!arc_file(hp, &shard, &off, &size)) { errno = ENOENT; return err_res("open", hp); }
+        uint64_t h = arc_new(shard, off, size);
+        if (!h) { errno = EMFILE; return err_res("open", hp); }
+        *out = h;
+        if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → archive handle (shard %u off %llu size %llu)", (now_ns() - g_t0_ns) / 1e9, path, mode, shard, (unsigned long long)off, (unsigned long long)size);
+        return RES_OK;
+    }
     int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
     if (fd < 0) return err_res("open", hp);
     struct stat st; fstat(fd, &st);
@@ -660,6 +739,21 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     if (!h) { *out = 0; return RES_FAIL; }   // a file handle is an fd; 0 is stdin and never a file the game opened: the null handle the game keeps using after a failed open
     size_t got = 0; uint64_t t0 = g_flag.bootprof ? now_ns() : 0;
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
+    archandle *ah;
+    if (arc_get(h, &ah)) {   // archive entry: clamp to the file, read from its shard
+        if (off < 0) { *out = 0; return RES_FAIL; }
+        uint64_t avail = (uint64_t)off < ah->size ? ah->size - (uint64_t)off : 0;
+        size_t want = sz < avail ? sz : (size_t)avail;
+        if (want) { ssize_t r = romfsarc_pread(ah->shard, ah->off + (uint64_t)off, buf, want);
+            if (r < 0) return err_res("pread (archive)", "handle"); got = (size_t)r; }
+        *out = got;
+        if (g_flag.bootprof) dm_prof_add(PROF_FS_READ, now_ns() - t0, got);
+        if (g_flag.fs) { static uint64_t n, bytes, next_b = 64 << 20; static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+            pthread_mutex_lock(&m); n++; bytes += got;
+            if (bytes >= next_b || n % 1000 == 0) { LOG("fs read total: %llu reads %.1f MiB (this one: archive offset %lld length %#zx)", n, bytes / 1048576.0, (long long)off, got); if (bytes >= next_b) next_b += 64 << 20; }
+            pthread_mutex_unlock(&m); }
+        return RES_OK;
+    }
     while (got < sz) {
         ssize_t r = dm_data_pread((int)h, (uint8_t *)buf + got, sz - got, off + got);
         if (r < 0) { if (errno == EINTR) continue; return err_res("pread", "fd"); }
@@ -706,6 +800,7 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 }
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) {
     if (!h) return RES_FAIL;
+    archandle *ah; if (arc_get(h, &ah)) { *out = (int64_t)ah->size; return RES_OK; }
     struct stat st; if (fstat((int)h, &st)) return err_res("fstat", "fd");
     *out = (int)h < 4096 && g_hm[(int)h] ? g_hm[(int)h]->size : st.st_size; return RES_OK;
 }
@@ -718,10 +813,11 @@ HLE_FORCE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", "fsp-srv → ftruncate(2)
 HLE_FORCE("_ZN2nn2fs9FlushFileENS0_10FileHandleE", "fsp-srv; host writes are already in the page cache, flushing is a no-op", Result, h_fs_FlushFile, uint64_t h) { (void)h; return RES_OK; }
 HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void, h_fs_CloseFile, uint64_t h) {
     if (!h) return;   // the null handle after a failed open (see ReadFile): do not touch fd 0
+    if (h >> 63) { arc_free(h); return; }   // archive handle: nothing to close on the host
     g_fmode[(int)h & 0xffff] = 0; g_fsave[(int)h & 0xffff] = 0;
     if ((int)h >= 0 && (int)h < 4096 && g_hm[(int)h]) { holemap *m = g_hm[(int)h]; g_hm[(int)h] = NULL; free(m->log); free(m->len); free(m->phys); free(m); }
     close((int)h); }
-HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { return g_fmode[(int)h & 0xffff]; }
+HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { return (h >> 63) ? MODE_READ : g_fmode[(int)h & 0xffff]; }
 
 // ---------- Path operations ----------
 HLE_FORCE("_ZN2nn2fs10CreateFileEPKcl", "fsp-srv → open(O_CREAT|O_EXCL)+ftruncate", Result, h_fs_CreateFile, const char *path, int64_t sz) {
@@ -784,6 +880,12 @@ HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)", Result, h_fs_
 }
 HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → stat(2)", Result, h_fs_GetEntryType, int32_t *out, const char *path) {
     HP(path); struct stat st;
+    if (ROMFSARC_IS_SYNTH(hp)) {
+        if (arc_dir(hp)) { *out = ENT_DIR; return RES_OK; }
+        uint32_t shard; uint64_t off, size;
+        if (arc_file(hp, &shard, &off, &size)) { *out = ENT_FILE; return RES_OK; }
+        errno = ENOENT; return err_res("stat", hp);
+    }
     if (stat(hp, &st)) return err_res("stat", hp);
     *out = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; return RES_OK;
 }
@@ -824,8 +926,35 @@ static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     }
     free(resolved); free(rel); free(guest); free(parent); free(all); free(names); free(roots);
 }
+// Archive directory snapshot: the archive's child list is turned into the same DirectoryEntry array
+// the overlay path uses, so ReadDirectory / GetDirectoryEntryCount need no archive branch.
+static void arc_snapshot(dirh_t *h, const char *hp) {
+    char rel[1024]; arc_norm(hp, rel, sizeof rel);
+    int n = romfsarc_count(rel);
+    if (n <= 0) return;
+    romfsarc_ent *ents = malloc((size_t)n * sizeof *ents);
+    if (!ents) die("archive directory snapshot allocation failed");
+    int got = romfsarc_list(rel, ents, n);
+    if (got <= 0) { free(ents); return; }
+    h->snap = calloc((size_t)got, sizeof *h->snap); h->nsnap = got;
+    if (!h->snap) die("archive directory snapshot allocation failed");
+    for (int i = 0; i < got; i++) {
+        strlcpy(h->snap[i].name, ents[i].name, sizeof h->snap[i].name);
+        h->snap[i].type = ents[i].is_dir ? ENT_DIR : ENT_FILE;
+        h->snap[i].size = ents[i].is_dir ? 0 : ents[i].size;
+    }
+    free(ents);
+}
 HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → opendir(3)", Result, h_fs_OpenDirectory, uint64_t *out, const char *path, int mode) {
-    HP(path); DIR *d = opendir(hp);
+    HP(path);
+    if (ROMFSARC_IS_SYNTH(hp)) {   // archive directory: no host DIR, only the snapshot
+        if (!arc_dir(hp)) { errno = ENOTDIR; return err_res("opendir", hp); }
+        dirh_t *h = calloc(1, sizeof *h); if (!h) die("directory handle allocation failed");
+        strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
+        arc_snapshot(h, hp);
+        *out = (uint64_t)h; return RES_OK;
+    }
+    DIR *d = opendir(hp);
     if (!d) return err_res("opendir", hp);
     dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
     const char *c = strchr(path, ':');
@@ -838,6 +967,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
     if (!hh) { *count = 0; return RES_FAIL; }
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0; struct dirent *e;
     if (h->snap) { while (n < max && h->psnap < h->nsnap) { DirectoryEntry *src = &h->snap[h->psnap++]; if (!(h->mode & (src->type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE))) continue; ents[n++] = *src; } *count = n; return RES_OK; }
+    if (!h->d) { *count = 0; return RES_OK; }   // an archive directory that turned out empty (no snapshot, no host DIR)
     int dfd = dirfd(h->d);
     while (n < max && (e = readdir(h->d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
@@ -855,7 +985,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
 }
 HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → closedir(3)", void, h_fs_CloseDirectory, uint64_t hh) {
     if (!hh) return;   // the game also closes after a failed open (handle 0): nothing to do in the original either
-    dirh_t *h = (dirh_t *)hh; closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
+    dirh_t *h = (dirh_t *)hh; if (h->d) closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
 }
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
@@ -872,6 +1002,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", "fsp-
 HLE_FORCE("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", "fsp-srv; directory entry count (filtered by the mode given at open, read position untouched)", Result, h_fs_DirCount, int64_t *out, uint64_t hh) {
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0;
     if (h->snap) { for (int64_t i = 0; i < h->nsnap; i++) if (h->mode & (h->snap[i].type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE)) n++; *out = n; return RES_OK; }
+    if (!h->d) { *out = 0; return RES_OK; }   // archive directory that turned out empty
     DIR *d = opendir(h->path); if (!d) return err_res("opendir", h->path);
     struct dirent *e;
     while ((e = readdir(d))) {
